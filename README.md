@@ -1,4 +1,4 @@
-**ABSTRACT 
+*ABSTRACT*
 
 This study explores the creation and application of decision tree and random forest classifiers aimed
  at predicting the edibility of mushrooms based on their attributes. Both models were developed manually
