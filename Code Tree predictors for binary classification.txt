@@ -1,0 +1,567 @@
+import pandas as pd
+import numpy as np
+from itertools import product
+from joblib import Parallel, delayed
+
+# Load the dataset
+data = pd.read_csv("secondary_data.csv", delimiter=';')
+print("Initial Data Overview:\n", data.head())
+
+# Clean the data
+print("\nDataset Information:")
+print(data.info())
+
+# Check for missing values
+missing_values = data.isnull().sum()
+print("\nMissing Values Per Column:")
+print(missing_values)
+
+# Drop columns with more than 25% missing values
+missing_percentage = data.isnull().mean() * 100
+columns_to_drop = missing_percentage[missing_percentage > 25].index
+data_cleaned = data.drop(columns=columns_to_drop)
+data_cleaned = data_cleaned.dropna()
+duplicates = data_cleaned.duplicated().sum()
+print(f"\nNumber of Duplicate Rows in Cleaned Dataset: {duplicates}")
+data_cleaned = data_cleaned.drop_duplicates()
+
+# Print the size of the initial dataset and the cleaned dataset
+initial_size = data.shape
+print(f"\nInitial Dataset Size: {initial_size[0]} rows, {initial_size[1]} columns")
+cleaned_size = data_cleaned.shape
+print(f"Cleaned Dataset Size: {cleaned_size[0]} rows, {cleaned_size[1]} columns")
+
+# Convert the target variable to binary (0 or 1)
+data_cleaned['class'] = data_cleaned['class'].map({'e': 1, 'p': 0})  
+
+# Separate features and target variable
+X = data_cleaned.drop('class', axis=1)  
+y = data_cleaned['class'].values  
+
+# Implementing stratified splitting 
+def stratified_split(X, y, test_size=0.2, random_state=42):
+    np.random.seed(random_state)
+    # Get unique classes and their indices
+    classes, y_indices = np.unique(y, return_inverse=True)
+    train_indices = []
+    test_indices = []
+    
+    for class_index in range(len(classes)):
+        # Find indices for each class
+        class_member_indices = np.where(y_indices == class_index)[0]
+        np.random.shuffle(class_member_indices)
+        
+        # Compute split size
+        n_test = int(len(class_member_indices) * test_size)
+        
+        # Split indices
+        test_indices.extend(class_member_indices[:n_test])
+        train_indices.extend(class_member_indices[n_test:])
+    
+    return np.array(train_indices), np.array(test_indices)
+
+# Perform stratified split
+train_indices, test_indices = stratified_split(X, y, test_size=0.2, random_state=42)
+
+# Split the dataset into training and test sets
+X_train, X_test = X.iloc[train_indices].reset_index(drop=True), X.iloc[test_indices].reset_index(drop=True)
+y_train, y_test = y[train_indices], y[test_indices]
+
+# Print the shape of the sets to confirm the split
+print(f"Training set size: {X_train.shape[0]} samples")
+print(f"Test set size: {X_test.shape[0]} samples")
+
+# Ensure no overlap between training and test sets
+overlap = pd.merge(X_train, X_test, how='inner')
+if not overlap.empty:
+    print(f"Warning: There are {len(overlap)} overlapping samples between training and test sets.")
+else:
+    print("No overlapping samples between training and test sets.")
+
+# TreeNode and DecisionTree classes
+class TreeNode:
+    def __init__(self, decision_function=None, left=None, right=None, is_leaf=False, prediction=None):
+        self.decision_function = decision_function
+        self.left = left
+        self.right = right
+        self.is_leaf = is_leaf
+        self.prediction = prediction
+
+    def predict(self, sample):
+        if self.is_leaf:
+            return self.prediction
+        else:
+            if self.decision_function(sample):
+                return self.left.predict(sample)
+            else:
+                return self.right.predict(sample)
+
+class DecisionTree:
+    def __init__(self, max_depth=None, min_samples_split=2, criterion='gini', max_splits=10, max_features=None):
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.criterion = criterion
+        self.max_splits = max_splits  
+        self.max_features = max_features  
+        self.root = None
+
+    def fit(self, X, y):
+        self.feature_names = X.columns if hasattr(X, 'columns') else None
+        self.n_features_ = X.shape[1]
+        self.root = self._grow_tree(X, y)
+
+    def _grow_tree(self, X, y, depth=0):
+        num_samples, num_features = X.shape
+        unique_classes, counts = np.unique(y, return_counts=True)
+        predicted_class = unique_classes[np.argmax(counts)]
+
+        # Stop critria
+        if (num_samples < self.min_samples_split or 
+            (self.max_depth is not None and depth >= self.max_depth) or 
+            len(unique_classes) == 1):
+            return TreeNode(is_leaf=True, prediction=predicted_class)
+
+        best_criterion_value = float('inf')
+        best_split = None
+
+        # Randomly select features to consider
+        if self.max_features is None or self.max_features > num_features:
+            features_indices = range(num_features)
+        else:
+            features_indices = np.random.choice(num_features, self.max_features, replace=False)
+
+        # Loop through selected features to find the best split
+        for feature_index in features_indices:
+            feature_values = X.iloc[:, feature_index]
+            current_feature = X.columns[feature_index] if self.feature_names is not None else feature_index
+
+            if np.issubdtype(feature_values.dtype, np.number):  # Numerical variables
+                thresholds = self._get_split_thresholds(feature_values)
+                for threshold in thresholds:
+                    left_indices = feature_values <= threshold
+                    right_indices = feature_values > threshold
+                    if np.sum(left_indices) == 0 or np.sum(right_indices) == 0:
+                        continue
+
+                    # Calculate the criterion for this split
+                    criterion_value = self._criterion(y[left_indices], y[right_indices])
+                    if criterion_value < best_criterion_value:
+                        best_criterion_value = criterion_value
+                        best_split = {
+                            'decision_function': lambda sample, index=feature_index, thresh=threshold: sample[index] <= thresh,
+                            'left_indices': left_indices,
+                            'right_indices': right_indices
+                        }
+            else:  # Categorical variables
+                categories = feature_values.unique()
+                for category in categories:
+                    left_indices = feature_values == category
+                    right_indices = feature_values != category
+                    if np.sum(left_indices) == 0 or np.sum(right_indices) == 0:
+                        continue
+
+                    # Calculate the criterion for this split
+                    criterion_value = self._criterion(y[left_indices], y[right_indices])
+                    if criterion_value < best_criterion_value:
+                        best_criterion_value = criterion_value
+                        best_split = {
+                            'decision_function': lambda sample, index=feature_index, cat=category: sample[index] == cat,
+                            'left_indices': left_indices,
+                            'right_indices': right_indices
+                        }
+
+        # If no valid split is found, create a leaf node
+        if best_split is None:
+            return TreeNode(is_leaf=True, prediction=predicted_class)
+
+        # Split with the best attribute and create sub-nodes
+        left_indices = best_split['left_indices']
+        right_indices = best_split['right_indices']
+
+        # Recursive tree growth
+        left_node = self._grow_tree(X[left_indices].reset_index(drop=True), y[left_indices], depth + 1)
+        right_node = self._grow_tree(X[right_indices].reset_index(drop=True), y[right_indices], depth + 1)
+
+        # Create the TreeNode
+        return TreeNode(
+            decision_function=best_split['decision_function'],
+            left=left_node,
+            right=right_node,
+            is_leaf=False
+        )
+
+    def _get_split_thresholds(self, feature_values):
+        """ Limit the number of potential splits using percentiles. """
+        unique_values = np.unique(feature_values)
+        if len(unique_values) <= self.max_splits:
+            return unique_values  
+        percentiles = np.linspace(0, 100, self.max_splits + 2)[1:-1]  
+        return np.percentile(unique_values, percentiles)
+
+    def _criterion(self, left_y, right_y):
+        if self.criterion == 'gini':
+            return self._gini_index(left_y, right_y)
+        elif self.criterion == 'entropy':
+            return self._entropy(left_y, right_y)
+        elif self.criterion == 'error':
+            return self._classification_error(left_y, right_y)
+        else:
+            raise ValueError("Unknown criterion")
+
+    def _gini_index(self, left_y, right_y):
+        total_samples = len(left_y) + len(right_y)
+        if total_samples == 0:
+            return 0
+
+        def gini(y):
+            class_counts = np.bincount(y)
+            p = class_counts / len(y)
+            return 1.0 - np.sum(p ** 2)
+
+        p_left = len(left_y) / total_samples
+        p_right = len(right_y) / total_samples
+        gini_left = gini(left_y)
+        gini_right = gini(right_y)
+        return p_left * gini_left + p_right * gini_right
+
+    def _entropy(self, left_y, right_y):
+        total_samples = len(left_y) + len(right_y)
+        if total_samples == 0:
+            return 0
+
+        def entropy_func(y):
+            if len(y) == 0:
+                return 0
+            class_counts = np.bincount(y)
+            p = class_counts / len(y)
+            p = p[p > 0]  
+            return -np.sum(p * np.log2(p))
+
+        p_left = len(left_y) / total_samples
+        p_right = len(right_y) / total_samples
+        entropy_left = entropy_func(left_y)
+        entropy_right = entropy_func(right_y)
+        return p_left * entropy_left + p_right * entropy_right
+
+    def _classification_error(self, left_y, right_y):
+        total_samples = len(left_y) + len(right_y)
+        if total_samples == 0:
+            return 0
+
+        def error(y):
+            if len(y) == 0:
+                return 0
+            class_counts = np.bincount(y)
+            majority_class_count = np.max(class_counts)
+            return 1 - (majority_class_count / len(y))
+
+        p_left = len(left_y) / total_samples
+        p_right = len(right_y) / total_samples
+        error_left = error(left_y)
+        error_right = error(right_y)
+        return p_left * error_left + p_right * error_right
+
+    def predict(self, X):
+        if isinstance(X, np.ndarray):
+            X_array = X
+        else:
+            X_array = X.values
+
+        return np.array([self.root.predict(sample) for sample in X_array])
+
+    def score(self, X, y):
+        predictions = self.predict(X)
+        accuracy = np.mean(predictions == y)
+        return accuracy
+
+    def compute_training_error(self, X, y):
+        predictions = self.predict(X)
+        error = np.mean(predictions != y)  
+        return error
+
+# Functions to compute confusion matrix and metrics
+def compute_confusion_matrix(y_true, y_pred):
+    """Compute the confusion matrix for binary classification."""
+    TP = np.sum((y_true == 1) & (y_pred == 1))  
+    TN = np.sum((y_true == 0) & (y_pred == 0))  
+    FP = np.sum((y_true == 0) & (y_pred == 1))  
+    FN = np.sum((y_true == 1) & (y_pred == 0))  
+    return TP, TN, FP, FN
+
+def compute_classification_metrics(TP, TN, FP, FN):
+    """Compute precision, recall, F1-score, and accuracy."""
+    precision = TP / (TP + FP) if (TP + FP) != 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) != 0 else 0
+    accuracy = (TP + TN) / (TP + TN + FP + FN)
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) != 0 else 0
+    return precision, recall, f1_score, accuracy
+
+# Function to run a fold and collect outputs
+def run_fold(i, indices, fold_size, X, y, model_class, params, cv):
+    # Define validation and training indices
+    val_indices = indices[i * fold_size: (i + 1) * fold_size]
+    train_indices = np.concatenate((indices[:i * fold_size], indices[(i + 1) * fold_size:]))
+
+    # Select training and validation sets
+    X_train_fold, y_train_fold = X.iloc[train_indices].reset_index(drop=True), y[train_indices]
+    X_val_fold, y_val_fold = X.iloc[val_indices].reset_index(drop=True), y[val_indices]
+
+    # Initialize the model
+    model = model_class(**params)
+    model.fit(X_train_fold, y_train_fold)
+
+    # Calculate score on validation set
+    score = model.score(X_val_fold, y_val_fold)
+    
+    # Prepare output message
+    output_message = f"Fold {i+1}/{cv} - Score: {score:.4f}"
+    
+    return score, output_message
+
+# Function for cross-validation
+def cross_validation(X, y, model_class, params, cv=5):
+    n_samples = len(y)
+    indices = np.arange(n_samples)
+    np.random.seed(42)  
+    np.random.shuffle(indices)  
+    fold_size = n_samples // cv
+
+    # Run cross-validation in parallel
+    results = Parallel(n_jobs=-1)(
+        delayed(run_fold)(i, indices, fold_size, X, y, model_class, params, cv)
+        for i in range(cv)
+    )
+
+    # Collect scores and output messages
+    scores = []
+    for score, message in results:
+        scores.append(score)
+        print(message)
+
+    # Calculate mean score
+    mean_score = np.mean(scores)
+    print(f"Mean Cross-Validation Score: {mean_score:.4f}")
+    return mean_score
+
+# Function for hyperparameter tuning
+def hyperparameter_tuning(X, y, model_class, param_grid, k=5):
+    best_score = -np.inf
+    best_params = {}
+
+    # Create all combinations of parameters
+    all_param_combinations = list(product(*param_grid.values()))
+    total_combinations = len(all_param_combinations)
+    print(f"Total hyperparameter combinations to evaluate: {total_combinations}")
+
+    for idx, param_combination in enumerate(all_param_combinations, 1):
+        params = {key: value for key, value in zip(param_grid.keys(), param_combination)}
+        
+        print(f"\nEvaluating combination {idx}/{total_combinations}: {params}")
+        
+        # Evaluate the current set of parameters using cross-validation
+        score = cross_validation(X, y, model_class, params, k)
+        print(f"Parameters: {params} - Mean CV Score: {score:.4f}")
+
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+    return best_params
+
+# Hyperparameter grid for DecisionTree
+param_grid_tree = {
+    'max_depth': [10, 20],
+    'min_samples_split': [2, 5],
+    'criterion': ['gini', 'entropy', 'error']
+}
+
+# Perform hyperparameter tuning on the training set only for DecisionTree
+best_hyperparams_tree = hyperparameter_tuning(X_train, y_train, DecisionTree, param_grid_tree, k=5)
+print("\nBest Hyperparameters for Decision Tree:", best_hyperparams_tree)
+
+# Fit the final DecisionTree model with the best hyperparameters on the training set
+final_model_tree = DecisionTree(**best_hyperparams_tree)
+final_model_tree.fit(X_train, y_train)
+
+# Compute training error for DecisionTree
+training_error_tree = final_model_tree.compute_training_error(X_train, y_train)
+print("Decision Tree Training Error:", training_error_tree)
+
+# Compute test error for DecisionTree
+test_error_tree = final_model_tree.compute_training_error(X_test, y_test)
+print("Decision Tree Test Error:", test_error_tree)
+
+# Print training error with test error for DecisionTree
+print("\n--- Decision Tree Performance Analysis ---")
+print(f"Training Error: {training_error_tree:.4f}")
+print(f"Test Error: {test_error_tree:.4f}")
+
+# Performance evaluation on the training set for DecisionTree
+y_train_pred_tree = final_model_tree.predict(X_train)
+TP_train_tree, TN_train_tree, FP_train_tree, FN_train_tree = compute_confusion_matrix(y_train, y_train_pred_tree)
+precision_train_tree, recall_train_tree, f1_train_tree, accuracy_train_tree = compute_classification_metrics(TP_train_tree, TN_train_tree, FP_train_tree, FN_train_tree)
+
+print("\n--- Decision Tree Performance on Training Set ---")
+print(f"Confusion Matrix:")
+print(f"TP: {TP_train_tree}, TN: {TN_train_tree}, FP: {FP_train_tree}, FN: {FN_train_tree}")
+print(f"Accuracy: {accuracy_train_tree:.4f}")
+print(f"Precision: {precision_train_tree:.4f}")
+print(f"Recall: {recall_train_tree:.4f}")
+print(f"F1-score: {f1_train_tree:.4f}")
+
+# Performance evaluation on the test set for DecisionTree
+y_test_pred_tree = final_model_tree.predict(X_test)
+TP_test_tree, TN_test_tree, FP_test_tree, FN_test_tree = compute_confusion_matrix(y_test, y_test_pred_tree)
+precision_test_tree, recall_test_tree, f1_test_tree, accuracy_test_tree = compute_classification_metrics(TP_test_tree, TN_test_tree, FP_test_tree, FN_test_tree)
+
+print("\n--- Decision Tree Performance on Test Set ---")
+print(f"Confusion Matrix:")
+print(f"TP: {TP_test_tree}, TN: {TN_test_tree}, FP: {FP_test_tree}, FN: {FN_test_tree}")
+print(f"Accuracy: {accuracy_test_tree:.4f}")
+print(f"Precision: {precision_test_tree:.4f}")
+print(f"Recall: {recall_test_tree:.4f}")
+print(f"F1-score: {f1_test_tree:.4f}")
+
+# Sum up of DecisionTree results
+print("\n--- Interpretation of Decision Tree Performance ---")
+print("Training Set:")
+print(f"Accuracy: {accuracy_train_tree:.4f}, Precision: {precision_train_tree:.4f}, Recall: {recall_train_tree:.4f}, F1-score: {f1_train_tree:.4f}")
+print("Test Set:")
+print(f"Accuracy: {accuracy_test_tree:.4f}, Precision: {precision_test_tree:.4f}, Recall: {recall_test_tree:.4f}, F1-score: {f1_test_tree:.4f}")
+
+# --- Random Forest Implementation ---
+
+# RandomForest class
+class RandomForest:
+    def __init__(self, n_estimators=100, max_depth=None, min_samples_split=2, criterion='gini', max_splits=10, max_features='sqrt', bootstrap=True, n_jobs=-1, random_state=None):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.criterion = criterion
+        self.max_splits = max_splits
+        self.max_features = max_features  
+        self.bootstrap = bootstrap
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.trees = []
+
+    def fit(self, X, y):
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+        self.trees = []
+        n_samples = X.shape[0]
+        
+        # Determine max_features
+        if self.max_features == 'sqrt':
+            max_features = int(np.sqrt(X.shape[1]))
+        elif self.max_features == 'log2':
+            max_features = int(np.log2(X.shape[1]))
+        elif isinstance(self.max_features, int):
+            max_features = self.max_features
+        else:
+            max_features = X.shape[1]  
+
+        # Function to train a single tree
+        def train_tree(seed):
+            np.random.seed(seed)
+            if self.bootstrap:
+                indices = np.random.choice(n_samples, n_samples, replace=True)
+                X_sample = X.iloc[indices].reset_index(drop=True)
+                y_sample = y[indices]
+            else:
+                X_sample = X
+                y_sample = y
+
+            tree = DecisionTree(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                criterion=self.criterion,
+                max_splits=self.max_splits,
+                max_features=max_features  
+            )
+            tree.fit(X_sample, y_sample)
+            return tree
+
+        # Train trees in parallel
+        seeds = np.random.randint(0, 10000, size=self.n_estimators)
+        self.trees = Parallel(n_jobs=self.n_jobs)(
+            delayed(train_tree)(seed) for seed in seeds
+        )
+
+    def predict(self, X):
+        tree_preds = np.array([tree.predict(X) for tree in self.trees])
+        predictions = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0, arr=tree_preds)
+        return predictions
+
+    def score(self, X, y):
+        predictions = self.predict(X)
+        accuracy = np.mean(predictions == y)
+        return accuracy
+
+    def compute_training_error(self, X, y):
+        predictions = self.predict(X)
+        error = np.mean(predictions != y)  
+        return error
+
+# Hyperparameter grid for RandomForest
+param_grid_forest = {
+    'n_estimators': [10, 20],
+    'max_depth': [10, 20],
+    'min_samples_split': [2, 5],
+    'criterion': ['gini', 'entropy', 'error'],
+    'max_features': ['sqrt', 'log2']
+}
+
+# Perform hyperparameter tuning on the training set only for RandomForest
+best_hyperparams_forest = hyperparameter_tuning(X_train, y_train, RandomForest, param_grid_forest, k=5)
+print("\nBest Hyperparameters for Random Forest:", best_hyperparams_forest)
+
+# Fit the final RandomForest model with the best hyperparameters on the training set
+final_model_forest = RandomForest(**best_hyperparams_forest)
+final_model_forest.fit(X_train, y_train)
+
+# Compute training error for RandomForest
+training_error_forest = final_model_forest.compute_training_error(X_train, y_train)
+print("Random Forest Training Error:", training_error_forest)
+
+# Compute test error for RandomForest
+test_error_forest = final_model_forest.compute_training_error(X_test, y_test)
+print("Random Forest Test Error:", test_error_forest)
+
+# Print training error with test error for RandomForest
+print("\n--- Random Forest Performance Analysis ---")
+print(f"Training Error: {training_error_forest:.4f}")
+print(f"Test Error: {test_error_forest:.4f}")
+
+# Performance evaluation on the training set for RandomForest
+y_train_pred_forest = final_model_forest.predict(X_train)
+TP_train_forest, TN_train_forest, FP_train_forest, FN_train_forest = compute_confusion_matrix(y_train, y_train_pred_forest)
+precision_train_forest, recall_train_forest, f1_train_forest, accuracy_train_forest = compute_classification_metrics(TP_train_forest, TN_train_forest, FP_train_forest, FN_train_forest)
+
+print("\n--- Random Forest Performance on Training Set ---")
+print(f"Confusion Matrix:")
+print(f"TP: {TP_train_forest}, TN: {TN_train_forest}, FP: {FP_train_forest}, FN: {FN_train_forest}")
+print(f"Accuracy: {accuracy_train_forest:.4f}")
+print(f"Precision: {precision_train_forest:.4f}")
+print(f"Recall: {recall_train_forest:.4f}")
+print(f"F1-score: {f1_train_forest:.4f}")
+
+# Performance evaluation on the test set for RandomForest
+y_test_pred_forest = final_model_forest.predict(X_test)
+TP_test_forest, TN_test_forest, FP_test_forest, FN_test_forest = compute_confusion_matrix(y_test, y_test_pred_forest)
+precision_test_forest, recall_test_forest, f1_test_forest, accuracy_test_forest = compute_classification_metrics(TP_test_forest, TN_test_forest, FP_test_forest, FN_test_forest)
+
+print("\n--- Random Forest Performance on Test Set ---")
+print(f"Confusion Matrix:")
+print(f"TP: {TP_test_forest}, TN: {TN_test_forest}, FP: {FP_test_forest}, FN: {FN_test_forest}")
+print(f"Accuracy: {accuracy_test_forest:.4f}")
+print(f"Precision: {precision_test_forest:.4f}")
+print(f"Recall: {recall_test_forest:.4f}")
+print(f"F1-score: {f1_test_forest:.4f}")
+
+# Sum up of RandomForest results
+print("\n--- Interpretation of Random Forest Performance ---")
+print("Training Set:")
+print(f"Accuracy: {accuracy_train_forest:.4f}, Precision: {precision_train_forest:.4f}, Recall: {recall_train_forest:.4f}, F1-score: {f1_train_forest:.4f}")
+print("Test Set:")
+print(f"Accuracy: {accuracy_test_forest:.4f}, Precision: {precision_test_forest:.4f}, Recall: {recall_test_forest:.4f}, F1-score: {f1_test_forest:.4f}")
